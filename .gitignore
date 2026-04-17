@@ -16,3 +16,9 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
+
+
+## checkpoint and logs
+**/benchmark_cache_llama3_8b_bf16
+**/tensorboard_logs
+
