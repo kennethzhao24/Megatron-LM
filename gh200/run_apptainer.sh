@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-IMAGE="${APPTAINER_IMAGE:-/u/yzhao25/slime_containers/slime-base.sif}"
+IMAGE="${APPTAINER_IMAGE:-/u/yzhao25/Sys-RL/slime_containers/slime-base.sif}"
 HF_BIND="${HF_BIND:-/work/nvme/bekz/yzhao25/huggingface:/mnt/huggingface}"
 DATASETS_BIND="${DATASETS_BIND:-/work/nvme/bcrc/yzhao25/rl_datasets:/mnt/datasets}"
 

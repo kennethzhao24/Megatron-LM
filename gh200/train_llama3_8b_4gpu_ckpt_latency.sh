@@ -15,11 +15,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_MEGATRON_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE="${APPTAINER_IMAGE:-/u/yzhao25/Sys-RL/slime_containers/slime-base.sif}"
 
-CHECKPOINT_PATH="${HOST_MEGATRON_DIR}/checkpoints/llama3_8b_bf16_4gpu"
-TENSORBOARD_LOGS_PATH="${HOST_MEGATRON_DIR}/tensorboard_logs/llama3_8b_bf16_4gpu"
-DATA_CACHE_PATH="${HOST_MEGATRON_DIR}/benchmark_cache_llama3_8b_bf16"
+# Use a dedicated checkpoint root so latency runs do not resume from or overwrite
+# normal training checkpoints.
+RUN_NAME="${RUN_NAME:-llama3_8b_bf16_4gpu_ckpt_latency}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/work/nvme/bfgy/yzhao25}"
+HOST_CHECKPOINT_PATH="${HOST_CHECKPOINT_PATH:-${CHECKPOINT_PATH:-${CHECKPOINT_ROOT}/${RUN_NAME}}}"
+CONTAINER_CHECKPOINT_PATH="${CONTAINER_CHECKPOINT_PATH:-/mnt/checkpoints/${RUN_NAME}}"
+TENSORBOARD_LOGS_PATH="${TENSORBOARD_LOGS_PATH:-${HOST_MEGATRON_DIR}/tensorboard_logs/${RUN_NAME}}"
+DATA_CACHE_PATH="${DATA_CACHE_PATH:-${HOST_MEGATRON_DIR}/benchmark_cache_llama3_8b_bf16}"
 
-mkdir -p "$CHECKPOINT_PATH" "$TENSORBOARD_LOGS_PATH" "$DATA_CACHE_PATH"
+mkdir -p "$HOST_CHECKPOINT_PATH" "$TENSORBOARD_LOGS_PATH" "$DATA_CACHE_PATH"
 
 # exclusively for GH200
 CACHE_ROOT="/tmp/${USER:-$(id -un)}-cache"
@@ -33,11 +38,19 @@ GPUS_PER_NODE=4
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6001}
 
-# Parallelism: TP=2, PP=1, CP=1 → 2 data-parallel replicas
-# TP=2 enables sequence-parallel and halves per-GPU activation memory
+# Match the main GH200 script.
 TP_SIZE=2
 PP_SIZE=2
 CP_SIZE=1
+
+# Short sample-based run for explicit checkpoint latency measurement. The default
+# writes one full checkpoint, which avoids needing quota for old + new checkpoints.
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
+LATENCY_ITERS="${LATENCY_ITERS:-4}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-4}"
+SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-1000000000}"
+TRAIN_SAMPLES="$((GLOBAL_BATCH_SIZE * LATENCY_ITERS))"
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -70,11 +83,11 @@ MODEL_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --micro-batch-size 2
-    --global-batch-size 64
-    --train-samples 100000
-    --lr-decay-samples 95000
-    --lr-warmup-samples 5000
+    --micro-batch-size "$MICRO_BATCH_SIZE"
+    --global-batch-size "$GLOBAL_BATCH_SIZE"
+    --train-samples "$TRAIN_SAMPLES"
+    --lr-decay-samples "$TRAIN_SAMPLES"
+    --lr-warmup-samples 0
     --lr 0.00015
     --min-lr 0.00001
     --lr-decay-style cosine
@@ -99,9 +112,6 @@ MODEL_PARALLEL_ARGS=(
     --pipeline-model-parallel-size $PP_SIZE
     --context-parallel-size $CP_SIZE
     --sequence-parallel
-    # --recompute-granularity full
-    # --recompute-method uniform
-    # --recompute-num-layers 16
 )
 
 DDP_ARGS=(
@@ -123,19 +133,40 @@ DATA_ARGS=(
 
 LOGGING_ARGS=(
     --log-interval 1
-    --eval-iters 32
-    --eval-interval 100
-    --save-interval 1000
+    --eval-iters 1
+    --eval-interval 100000
+    --save-interval "$SAVE_INTERVAL"
+    --save-retain-interval "$SAVE_RETAIN_INTERVAL"
     --log-throughput
+    --log-timers-to-tensorboard
     --ckpt-format torch_dist
+    --ckpt-assume-constant-structure
     --distributed-timeout-minutes 60
-    --save "$CHECKPOINT_PATH"
-    --load "$CHECKPOINT_PATH"
+    --save "$CONTAINER_CHECKPOINT_PATH"
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
 )
 
+# Optional resume/load measurement:
+#   LOAD_CHECKPOINT_PATH=/mnt/checkpoints/llama3_8b_bf16_4gpu_ckpt_latency bash gh200/train_llama3_8b_4gpu_ckpt_latency.sh
+if [[ -n "${LOAD_CHECKPOINT_PATH:-}" ]]; then
+    LOGGING_ARGS+=(--load "$LOAD_CHECKPOINT_PATH")
+fi
+
+if [[ "${ASYNC_SAVE:-0}" == "1" ]]; then
+    LOGGING_ARGS+=(--async-save)
+fi
+
+echo "Checkpoint latency run:"
+echo "  host checkpoint path:      ${HOST_CHECKPOINT_PATH}"
+echo "  container checkpoint path: ${CONTAINER_CHECKPOINT_PATH}"
+echo "  train samples:   ${TRAIN_SAMPLES} (${LATENCY_ITERS} iterations at global batch ${GLOBAL_BATCH_SIZE})"
+echo "  save interval:   ${SAVE_INTERVAL}"
+echo "  retain interval: ${SAVE_RETAIN_INTERVAL} (after a successful later save, deletes older checkpoints)"
+echo "  optimizer state: saved"
+echo "  async save:      ${ASYNC_SAVE:-0}"
+
 apptainer exec --nv \
-    --bind "${CHECKPOINT_PATH}:${CHECKPOINT_PATH}" \
+    --bind "${HOST_CHECKPOINT_PATH}:${CONTAINER_CHECKPOINT_PATH}" \
     --bind "${TENSORBOARD_LOGS_PATH}:${TENSORBOARD_LOGS_PATH}" \
     --bind "${DATA_CACHE_PATH}:${DATA_CACHE_PATH}" \
     "${IMAGE}" \
